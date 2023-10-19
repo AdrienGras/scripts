@@ -160,6 +160,9 @@ clr_bold clr_cyan "| (__/  )___) (___/\____) || (____/\| (___) || ) \ \__| (__/ 
 clr_bold clr_cyan "(______/ \_______/\_______)(_______/(_______)|/   \__/(______/ "
 echo ""
 
+clr_bold clr_cyan "by @XSlender"
+echo ""
+
 # killing all instances of discord
 clr_bold clr_white " ⚙️  Removing running instances of Discord..."
 sudo pkill -f Discord
