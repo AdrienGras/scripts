@@ -183,7 +183,7 @@ fi
 
 # Download Discord
 clr_bold clr_white " 📩 Downloading new version..."
-curl -sS -L "$link" -o $file
+curl -k -sS -L "$link" -o $file
 
 clr_bold clr_white " 📂 Extracting new version..."
 tar -xf $file

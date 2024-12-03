@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# Check parameters
+# 1 is the input file
+# 2 is the output file (not required)
+
+if [ -z "$1" ]; then
+    echo "Usage: $0 <input file> [output file]"
+    exit 1
+fi
+
+INPUT="$1"
+
+if [ -z "$2" ]; then
+    OUTPUT="${INPUT%.*}.mp3"
+else
+    OUTPUT="$2"
+fi
+
+# Check if ffmpeg is installed
+if ! command -v ffmpeg >/dev/null; then
+    echo "Error: ffmpeg is not installed." >&2
+    echo "Please install ffmpeg and try again: sudo apt install ffmpeg"
+    exit 1
+fi
+
+# Convert video to MP3
+ffmpeg -i "$INPUT" -vn -acodec libmp3lame -ac 2 -ab 160k -ar 48000 "$OUTPUT"
+
+echo "Conversion complete: $OUTPUT"
