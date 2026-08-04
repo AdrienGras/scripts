@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+#
+# sshgen — génère un package de connexion SSH prêt à livrer.
+#
+#   sshgen <host> <user> [port] [comment]
+#
+# Produit dans le répertoire courant :
+#   ./<host>-<user>/README.md         fiche de connexion (formalisme maison)
+#   ./<host>-<user>/id_ed25519        clé privée OpenSSH, chiffrée
+#   ./<host>-<user>/id_ed25519.pub    clé publique OpenSSH
+#   ./<host>-<user>/id_ed25519.ppk    clé privée PuTTY (PPK v3 / Argon2id)
+#   ./<host>-<user>.tar.gz            l'ensemble, prêt à envoyer
+#
+set -euo pipefail
+
+# --- Paramètres de génération ------------------------------------------------
+
+# 84 symboles : alphanumériques + ponctuation, sans ' " ` \ $ ni espace.
+# Ces cinq exclusions évitent tout échappement dans un .env, un YAML ou un
+# appel shell. log2(84) * 24 ≈ 153 bits d'entropie par secret.
+readonly CHARSET='A-Za-z0-9!#%()*+,.:;=?@[]^_{}~-'
+readonly SECRET_LEN=24
+
+# Tours de bcrypt-pbkdf protégeant la clé privée OpenSSH au repos.
+# OpenSSH en fait 16 par défaut ; 100 coûte ~0,1 s au déverrouillage et
+# ralentit d'autant toute tentative de bruteforce sur un fichier volé.
+readonly KDF_ROUNDS=100
+
+# --- Sortie ------------------------------------------------------------------
+
+if [[ -t 2 ]]; then
+    readonly C_RESET=$'\033[0m' C_DIM=$'\033[2m' C_RED=$'\033[31m'
+    readonly C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_BOLD=$'\033[1m'
+else
+    readonly C_RESET='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_BOLD=''
+fi
+
+info() { printf '%s\n' "$*" >&2; }
+ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*" >&2; }
+warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: sshgen <host> <user> [port] [comment]
+
+  host      adresse ou nom d'hôte du serveur
+  user      nom du compte à créer
+  port      port SSH                    (défaut : 22)
+  comment   commentaire inscrit dans la clé  (défaut : <user>@<host>)
+
+Exemple :
+  sshgen 51.159.103.172 lmaluski
+  sshgen srv.exemple.fr alice 2222 alice@exemple.fr
+EOF
+    exit 2
+}
+
+# --- Prérequis ---------------------------------------------------------------
+
+check_deps() {
+    local missing=()
+    command -v ssh-keygen >/dev/null || missing+=('openssh-client')
+    command -v puttygen   >/dev/null || missing+=('putty-tools')
+    command -v tar        >/dev/null || missing+=('tar')
+
+    (( ${#missing[@]} == 0 )) && return 0
+    die "paquets manquants : ${missing[*]}
+    Installe-les avec :  sudo apt install ${missing[*]}"
+}
+
+# --- Génération des secrets --------------------------------------------------
+
+# Tire un secret de $SECRET_LEN caractères dans $CHARSET.
+#
+# `tr -dc` réalise un échantillonnage par rejet : les octets de /dev/urandom
+# hors charset sont jetés plutôt que repliés par modulo. Contrairement au
+# classique `$RANDOM % ${#charset}`, aucun biais ne favorise les premiers
+# caractères de l'alphabet — chaque symbole a exactement la même probabilité.
+#
+# La boucle rejette ensuite les tirages auxquels manque une classe de
+# caractères, pour satisfaire les politiques pam_pwquality les plus courantes.
+# La fraction rejetée est de l'ordre de 1 sur 5 000, la perte d'entropie
+# associée est inférieure à 0,001 bit.
+gen_secret() {
+    local secret
+    while :; do
+        secret=$(LC_ALL=C tr -dc "$CHARSET" </dev/urandom | head -c "$SECRET_LEN") || true
+
+        (( ${#secret} == SECRET_LEN ))      || continue  # pipe tronqué
+        [[ $secret == *[[:upper:]]* ]]      || continue
+        [[ $secret == *[[:lower:]]* ]]      || continue
+        [[ $secret == *[[:digit:]]* ]]      || continue
+        [[ -n ${secret//[[:alnum:]]/} ]]    || continue  # au moins un signe
+
+        printf '%s' "$secret"
+        return 0
+    done
+}
+
+# --- Fichier de passphrase éphémère ------------------------------------------
+
+PASS_FILE=''
+cleanup() { [[ -n $PASS_FILE ]] && rm -f -- "$PASS_FILE"; }
+trap cleanup EXIT INT TERM
+
+# puttygen ne sait lire une passphrase que depuis un fichier. On le place sur
+# /dev/shm — un tmpfs, donc en RAM : le secret ne touche jamais le disque et
+# disparaît au plus tard au prochain redémarrage. Repli sur $TMPDIR si absent.
+write_pass_file() {
+    local dir='/dev/shm'
+    [[ -d $dir && -w $dir ]] || dir="${TMPDIR:-/tmp}"
+
+    PASS_FILE=$(mktemp "$dir/sshgen.XXXXXXXXXX")
+    chmod 600 -- "$PASS_FILE"
+    printf '%s\n' "$1" >"$PASS_FILE"
+}
+
+# --- Étapes ------------------------------------------------------------------
+
+make_keys() {
+    local dir=$1 comment=$2 key_pass=$3
+    local key="$dir/id_ed25519"
+
+    # ed25519 n'a pas de taille de clé réglable (255 bits fixes sur
+    # Curve25519) : -a est le seul levier de durcissement disponible.
+    #
+    # Limite connue : ssh-keygen n'accepte la passphrase que via -N, donc en
+    # ligne de commande. Elle est visible dans /proc/<pid>/cmdline pendant la
+    # fraction de seconde que dure l'appel. Sans importance sur un poste
+    # mono-utilisateur ; à éviter sur une machine partagée.
+    ssh-keygen -q -t ed25519 -a "$KDF_ROUNDS" -C "$comment" \
+        -N "$key_pass" -f "$key" </dev/null
+
+    write_pass_file "$key_pass"
+
+    # PPK v3 chiffre la clé avec Argon2id, résistant aux attaques par GPU —
+    # là où le v2 se contentait de SHA-1, cassable en pratique.
+    puttygen "$key" -O private -o "$key.ppk" \
+        --old-passphrase "$PASS_FILE" \
+        --new-passphrase "$PASS_FILE" \
+        --ppk-param version=3,kdf=argon2id \
+        -C "$comment" -q
+
+    chmod 600 -- "$key" "$key.ppk"
+    chmod 644 -- "$key.pub"
+}
+
+write_readme() {
+    local dir=$1 host=$2 port=$3 user=$4 account_pass=$5 key_pass=$6
+
+    cat >"$dir/README.md" <<EOF
+host: $host
+port: $port
+user: $user
+pass: $account_pass
+ssh pass: $key_pass
+EOF
+    chmod 600 -- "$dir/README.md"
+}
+
+package() {
+    local dir=$1 archive="$1.tar.gz"
+
+    tar -czf "$archive" -- "$dir"
+    chmod 600 -- "$archive"
+    printf '%s' "$archive"
+}
+
+# --- Programme ---------------------------------------------------------------
+
+main() {
+    [[ ${1:-} == -h || ${1:-} == --help ]] && usage
+    (( $# >= 2 && $# <= 4 )) || usage
+
+    local host=$1 user=$2 port=${3:-22} comment=${4:-"$2@$1"}
+
+    [[ $port =~ ^[0-9]+$ ]] && (( port > 0 && port < 65536 )) \
+        || die "port invalide : $port"
+
+    check_deps
+
+    local dir="$host-$user"
+    # Un dossier existant contient peut-être une clé privée déjà livrée :
+    # on refuse plutôt que d'écraser un secret irrécupérable.
+    [[ -e $dir ]] && die "« $dir » existe déjà — déplace-le ou renomme-le."
+
+    mkdir -m 700 -- "$dir"
+
+    local account_pass key_pass
+    account_pass=$(gen_secret)
+    key_pass=$(gen_secret)
+
+    make_keys "$dir" "$comment" "$key_pass"
+    write_readme "$dir" "$host" "$port" "$user" "$account_pass" "$key_pass"
+
+    local archive
+    archive=$(package "$dir")
+
+    local fingerprint
+    fingerprint=$(ssh-keygen -lf "$dir/id_ed25519.pub" | awk '{print $2}')
+
+    info ''
+    ok "Package généré pour ${C_BOLD}$user@$host${C_RESET}"
+    info ''
+    info "  $dir/"
+    info "    README.md  id_ed25519  id_ed25519.pub  id_ed25519.ppk"
+    info "  $archive"
+    info ''
+    info "  ${C_DIM}empreinte  $fingerprint${C_RESET}"
+    info "  ${C_DIM}entropie   ~153 bits par secret (24 car., charset de 84)${C_RESET}"
+    info ''
+    warn "L'archive n'est pas chiffrée : elle contient la clé privée"
+    info "  ${C_DIM}et sa passphrase. Privilégie un canal de transfert sûr.${C_RESET}"
+    info ''
+    info "  ${C_DIM}Côté serveur :${C_RESET}"
+    info "  ${C_DIM}  useradd -m -s /bin/bash $user${C_RESET}"
+    info "  ${C_DIM}  echo '$user:<pass du README>' | chpasswd${C_RESET}"
+    info "  ${C_DIM}  install -d -m 700 -o $user -g $user /home/$user/.ssh${C_RESET}"
+    info "  ${C_DIM}  install -m 600 -o $user -g $user \\
+      $dir/id_ed25519.pub /home/$user/.ssh/authorized_keys${C_RESET}"
+    info ''
+}
+
+main "$@"
